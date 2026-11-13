@@ -1,0 +1,98 @@
+name: Terraform deployment
+on:
+  workflow_call:
+    inputs:
+      layer:
+        type: string
+        required: true
+      target:
+        type: string
+        required: true
+      apply:
+        type: boolean
+        required: true
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: terraform-${{ inputs.layer }}-${{ inputs.target }}
+  cancel-in-progress: false
+env:
+  TF_IN_AUTOMATION: "1"
+  LAYER: ${{ inputs.layer }}
+  TARGET: ${{ inputs.target }}
+  DATABRICKS_AUTH_TYPE: github-oidc
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: ${{ inputs.layer }}-${{ inputs.target }}-plan
+    env:
+      DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
+      PLAN_BUCKET: ${{ vars.PLAN_BUCKET }}
+    outputs:
+      digest: ${{ steps.save.outputs.digest }}
+      object: ${{ steps.save.outputs.object }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: 1.13.4
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Verify AWS account
+        env:
+          EXPECTED: ${{ vars.AWS_ACCOUNT_ID }}
+        run: test "$(aws sts get-caller-identity --query Account --output text)" = "$EXPECTED"
+      - run: scripts/target.sh "$LAYER" "$TARGET" init
+
+      - run: scripts/target.sh "$LAYER" "$TARGET" plan
+      - id: save
+        if: inputs.apply
+        run: |
+          file=".tfdata/$LAYER/$TARGET/deployment.tfplan"
+          object="plans/$GITHUB_REPOSITORY/$LAYER/$TARGET/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT.tfplan"
+          aws s3 cp "$file" "s3://$PLAN_BUCKET/$object" --only-show-errors
+          echo "digest=$(sha256sum "$file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "object=$object" >> "$GITHUB_OUTPUT"
+  apply:
+    needs: plan
+    if: inputs.apply
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: ${{ inputs.layer }}-${{ inputs.target }}-apply
+    env:
+      DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
+      PLAN_BUCKET: ${{ vars.PLAN_BUCKET }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: 1.13.4
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Verify AWS account
+        env:
+          EXPECTED: ${{ vars.AWS_ACCOUNT_ID }}
+        run: test "$(aws sts get-caller-identity --query Account --output text)" = "$EXPECTED"
+      - run: scripts/target.sh "$LAYER" "$TARGET" init
+
+      - name: Verify and apply the saved plan
+        env:
+          OBJECT: ${{ needs.plan.outputs.object }}
+          DIGEST: ${{ needs.plan.outputs.digest }}
+        run: |
+          file=".tfdata/$LAYER/$TARGET/deployment.tfplan"
+          aws s3 cp "s3://$PLAN_BUCKET/$OBJECT" "$file" --only-show-errors
+          printf '%s  %s\n' "$DIGEST" "$file" | sha256sum --check --status
+          scripts/target.sh "$LAYER" "$TARGET" apply

@@ -1,0 +1,10 @@
+{
+  "account_id": "REPLACE_ACCOUNT_UUID",
+  "region": "ap-south-1",
+  "governance_host": "https://replace-governance.cloud.databricks.com",
+  "metastore_id": "REPLACE_METASTORE_UUID",
+  "access_group": "analytics-nonprod",
+  "existing_catalog": "analytics_stg",
+  "managed_base_url": "s3://replace-stg-lake/lake/self-service",
+  "deployment_prefix": "analytics"
+}

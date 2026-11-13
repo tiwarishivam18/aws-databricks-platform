@@ -1,0 +1,11 @@
+{
+  "account_id": "b63ed0a0-17d1-43bb-9a67-fe6f9f676f0c",
+  "region": "ap-south-1",
+  "governance_host": "https://dbc-0fd35d91-2dd0.cloud.databricks.com",
+  "governance_workspace_id": 7474649726386185,
+  "metastore_id": "a8a6fee6-0580-4a0a-b72d-f748e5ac24ce",
+  "access_group": "analytics-nonprod",
+  "existing_catalog": "analytics_dev",
+  "managed_base_url": "s3://shivam-dbx-dev-lake-043309323736/lake/self-service",
+  "deployment_prefix": "analytics"
+}

@@ -1,0 +1,8 @@
+**/.terraform/
+.tfdata/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash*.log
+*.tfvars.local
+.env

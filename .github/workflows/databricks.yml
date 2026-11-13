@@ -1,0 +1,25 @@
+name: Databricks
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Deployment target
+        type: choice
+        options: [dev, stg, prd, shared]
+        required: true
+      apply:
+        description: Apply the reviewed plan
+        type: boolean
+        default: false
+permissions: {}
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/terraform-deploy.yml
+    with:
+      layer: databricks
+      target: ${{ inputs.target }}
+      apply: ${{ inputs.apply }}
