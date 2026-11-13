@@ -107,7 +107,9 @@ jobs:
           test "$(aws sts get-caller-identity --query Account --output text)" = "$EXPECTED_ACCOUNT"
           test -s .terraform.lock.hcl
           python3 scripts/request.py prepare
-          terraform init -input=false -lockfile=readonly -backend-config="$RUNNER_TEMP/backend.hcl"
+          # terraform init -input=false -lockfile=readonly -backend-config="$RUNNER_TEMP/backend.hcl"
+          terraform init -input=false -backend-config="$RUNNER_TEMP/backend.hcl"
+          git diff --exit-code -- .terraform.lock.hcl
           terraform validate
 
       - name: Apply approved plan
