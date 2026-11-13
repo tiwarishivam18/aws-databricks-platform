@@ -67,7 +67,39 @@ jobs:
           terraform init -input=false -backend-config="$RUNNER_TEMP/backend.hcl"
           git diff --exit-code -- .terraform.lock.hcl
           terraform validate
+          - name: Check Databricks account federation
+        shell: bash
+        env:
+          DBX_ACCOUNT: b63ed0a0-17d1-43bb-9a67-fe6f9f676f0c
+        run: |
+          set -euo pipefail
+          jwt=$(curl -fsS -G "$ACTIONS_ID_TOKEN_REQUEST_URL" \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            --data-urlencode "audience=$DBX_ACCOUNT" | jq -er '.value')
 
+          printf '%s' "$jwt" | python3 -c '
+          import base64, json, sys
+          payload = sys.stdin.read().split(".")[1]
+          claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+          for key in ("iss", "aud", "sub"):
+              print(f"{key} = {claims[key]}")
+          '
+
+          response=$(mktemp)
+          trap 'rm -f "$response"' EXIT
+          status=$(printf '%s' "$jwt" | curl -sS -o "$response" -w '%{http_code}' \
+            "https://accounts.cloud.databricks.com/oidc/accounts/$DBX_ACCOUNT/v1/token" \
+            --data-urlencode 'subject_token@-' \
+            --data 'subject_token_type=urn:ietf:params:oauth:token-type:jwt' \
+            --data 'grant_type=urn:ietf:params:oauth:grant-type:token-exchange' \
+            --data 'scope=all-apis' \
+            --data-urlencode "client_id=$DATABRICKS_CLIENT_ID")
+
+          echo "Databricks token exchange HTTP $status"
+          if [[ "$status" != 200 ]]; then
+            jq -r '{error, error_description, error_id}' "$response"
+            exit 1
+          fi
       - name: Plan catalog and bindings
         run: |
           terraform plan -input=false -lock-timeout=5m -var-file="$RUNNER_TEMP/catalog.tfvars.json" -out="$RUNNER_TEMP/deploy.tfplan"
