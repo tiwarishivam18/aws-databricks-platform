@@ -1,4 +1,5 @@
 name: Request catalog
+
 on:
   workflow_dispatch:
     inputs:
@@ -7,24 +8,35 @@ on:
         type: choice
         options: [dev, stg, prd]
         required: true
+
       name:
         description: Catalog short name (e.g. sales)
         type: string
         required: true
+
       workspaces:
-        description: Existing workspace aliases to add (e.g. fraudlab,reporting)
+        description: Existing workspace aliases to add (e.g. serverless)
         type: string
         required: true
+
+      apply:
+        description: Apply the saved catalog plan
+        type: boolean
+        default: false
+
 permissions:
   contents: read
   id-token: write
+
 concurrency:
   group: catalog-factory-${{ inputs.environment }}-${{ inputs.name }}
   cancel-in-progress: false
+
 defaults:
   run:
     shell: bash
     working-directory: catalog-factory
+
 env:
   TARGET: ${{ inputs.environment }}
   SLUG: ${{ inputs.name }}
@@ -32,51 +44,68 @@ env:
   TF_IN_AUTOMATION: "1"
   TF_WORKSPACE: default
   DATABRICKS_AUTH_TYPE: github-oidc
+
 jobs:
   plan:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     environment: catalog-${{ inputs.environment }}-plan
+
     env:
       DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
       STATE_BUCKET: ${{ vars.STATE_BUCKET }}
       STATE_REGION: ${{ vars.STATE_REGION }}
       PLAN_BUCKET: ${{ vars.PLAN_BUCKET }}
       EXPECTED_ACCOUNT: ${{ vars.EXPECTED_ACCOUNT }}
+
     outputs:
       digest: ${{ steps.save.outputs.digest }}
       object: ${{ steps.save.outputs.object }}
+
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
         with:
           terraform_version: 1.17.2
           terraform_wrapper: false
-      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+
+      - name: Configure AWS plan credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.STATE_REGION }}
+
       - name: Initialize catalog state
         run: |
+          set -euo pipefail
           test "$(aws sts get-caller-identity --query Account --output text)" = "$EXPECTED_ACCOUNT"
           test -s .terraform.lock.hcl
           python3 scripts/request.py prepare
           terraform init -input=false -backend-config="$RUNNER_TEMP/backend.hcl"
           git diff --exit-code -- .terraform.lock.hcl
           terraform validate
-          - name: Check Databricks account federation
-        shell: bash
-        env:
-          DBX_ACCOUNT: b63ed0a0-17d1-43bb-9a67-fe6f9f676f0c
+
+      - name: Check Databricks account federation
         run: |
           set -euo pipefail
-          jwt=$(curl -fsS -G "$ACTIONS_ID_TOKEN_REQUEST_URL" \
-            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            --data-urlencode "audience=$DBX_ACCOUNT" | jq -er '.value')
 
+          # Use the same Databricks account that this request passes to Terraform.
+          account_id=$(jq -er '.config.account_id | select(type == "string" and length > 0)' \
+            "$RUNNER_TEMP/catalog.tfvars.json")
+
+          jwt=$(curl --fail --silent --show-error --get \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL" \
+            --header "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            --data-urlencode "audience=$account_id" |
+            jq -er '.value')
+
+          # Print only the identity claims needed to check the federation policy.
           printf '%s' "$jwt" | python3 -c '
           import base64, json, sys
           payload = sys.stdin.read().split(".")[1]
@@ -87,8 +116,11 @@ jobs:
 
           response=$(mktemp)
           trap 'rm -f "$response"' EXIT
-          status=$(printf '%s' "$jwt" | curl -sS -o "$response" -w '%{http_code}' \
-            "https://accounts.cloud.databricks.com/oidc/accounts/$DBX_ACCOUNT/v1/token" \
+
+          status=$(printf '%s' "$jwt" | curl --silent --show-error \
+            --output "$response" \
+            --write-out '%{http_code}' \
+            "https://accounts.cloud.databricks.com/oidc/accounts/$account_id/v1/token" \
             --data-urlencode 'subject_token@-' \
             --data 'subject_token_type=urn:ietf:params:oauth:token-type:jwt' \
             --data 'grant_type=urn:ietf:params:oauth:grant-type:token-exchange' \
@@ -96,52 +128,78 @@ jobs:
             --data-urlencode "client_id=$DATABRICKS_CLIENT_ID")
 
           echo "Databricks token exchange HTTP $status"
-          if [[ "$status" != 200 ]]; then
-            jq -r '{error, error_description, error_id}' "$response"
+
+          if [[ "$status" != "200" ]]; then
+            jq '{error, error_description, error_id}' "$response" ||
+              echo "Databricks returned a non-JSON error response."
             exit 1
           fi
+
       - name: Plan catalog and bindings
         run: |
-          terraform plan -input=false -lock-timeout=5m -var-file="$RUNNER_TEMP/catalog.tfvars.json" -out="$RUNNER_TEMP/deploy.tfplan"
-          terraform show -json "$RUNNER_TEMP/deploy.tfplan" | python3 scripts/request.py check-plan
+          set -euo pipefail
+          terraform plan \
+            -input=false \
+            -lock-timeout=5m \
+            -var-file="$RUNNER_TEMP/catalog.tfvars.json" \
+            -out="$RUNNER_TEMP/deploy.tfplan"
+
+          terraform show -json "$RUNNER_TEMP/deploy.tfplan" |
+            python3 scripts/request.py check-plan
+
       - name: Save reviewed plan
         id: save
         run: |
+          set -euo pipefail
           file="$RUNNER_TEMP/deploy.tfplan"
           object="catalog-plans/$GITHUB_REPOSITORY/$TARGET/$SLUG/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT.tfplan"
+
           aws s3 cp "$file" "s3://$PLAN_BUCKET/$object" --only-show-errors
           echo "digest=$(sha256sum "$file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           echo "object=$object" >> "$GITHUB_OUTPUT"
+
   apply:
     needs: plan
+    if: ${{ inputs.apply }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     environment: catalog-${{ inputs.environment }}-apply
+
     env:
       DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
       STATE_BUCKET: ${{ vars.STATE_BUCKET }}
       STATE_REGION: ${{ vars.STATE_REGION }}
       PLAN_BUCKET: ${{ vars.PLAN_BUCKET }}
       EXPECTED_ACCOUNT: ${{ vars.EXPECTED_ACCOUNT }}
+
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
         with:
           terraform_version: 1.17.2
           terraform_wrapper: false
-      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+
+      - name: Configure AWS apply credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.STATE_REGION }}
+
       - name: Initialize catalog state
         run: |
+          set -euo pipefail
           test "$(aws sts get-caller-identity --query Account --output text)" = "$EXPECTED_ACCOUNT"
           test -s .terraform.lock.hcl
           python3 scripts/request.py prepare
-          # terraform init -input=false -lockfile=readonly -backend-config="$RUNNER_TEMP/backend.hcl"
-          terraform init -input=false -lockfile=readonly -backend-config="$RUNNER_TEMP/backend.hcl"
+          terraform init \
+            -input=false \
+            -lockfile=readonly \
+            -backend-config="$RUNNER_TEMP/backend.hcl"
           terraform validate
 
       - name: Apply approved plan
@@ -149,11 +207,15 @@ jobs:
           OBJECT: ${{ needs.plan.outputs.object }}
           DIGEST: ${{ needs.plan.outputs.digest }}
         run: |
+          set -euo pipefail
           file="$RUNNER_TEMP/deploy.tfplan"
+
           aws s3 cp "s3://$PLAN_BUCKET/$OBJECT" "$file" --only-show-errors
           printf '%s  %s\n' "$DIGEST" "$file" | sha256sum --check --status
+
           python3 scripts/request.py record
           terraform apply -input=false -lock-timeout=5m "$file"
+
           {
             echo "### Catalog ready"
             echo "Catalog: $(terraform output -raw catalog)"
