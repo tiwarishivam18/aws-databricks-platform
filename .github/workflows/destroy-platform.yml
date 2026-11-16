@@ -44,7 +44,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
-    environment: ${{ inputs.component }}-plan
+    environment: catalog-dev-plan
 
     env:
       DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
@@ -216,7 +216,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
 
-    environment: ${{ inputs.component }}-apply
+    environment: catalog-dev-apply
 
     env:
       DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
