@@ -1,0 +1,319 @@
+name: Destroy platform resources
+
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: "Component to destroy — run in the listed order"
+        type: choice
+        options:
+          - databricks-dev
+          - databricks-shared
+          - aws-dev
+        required: true
+
+      apply:
+        description: "Execute destruction after generating the plan"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+# Matches the original infrastructure workflows' concurrency groups.
+concurrency:
+  group: terraform-${{ inputs.component == 'aws-dev' && 'aws' || 'databricks' }}-${{ inputs.component == 'databricks-shared' && 'shared' || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "1"
+  TF_WORKSPACE: default
+  DATABRICKS_AUTH_TYPE: github-oidc
+  LAYER: ${{ inputs.component == 'aws-dev' && 'aws' || 'databricks' }}
+  TARGET: ${{ inputs.component == 'databricks-shared' && 'shared' || 'dev' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: Plan destruction
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    environment: ${{ inputs.component }}-plan
+
+    env:
+      DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
+      PLAN_BUCKET: ${{ vars.PLAN_BUCKET }}
+
+    outputs:
+      digest: ${{ steps.save.outputs.digest }}
+      object: ${{ steps.save.outputs.object }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: 1.17.2
+          terraform_wrapper: false
+
+      - name: Configure AWS plan credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify AWS account and configuration
+        env:
+          EXPECTED: ${{ vars.AWS_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+
+          test "$EXPECTED" = "043309323736"
+          test "$(aws sts get-caller-identity --query Account --output text)" = "$EXPECTED"
+          test -n "$PLAN_BUCKET"
+          test -f scripts/target.sh
+
+          if [[ "$LAYER" == "databricks" ]]; then
+            test -n "$DATABRICKS_CLIENT_ID"
+          fi
+
+      - name: Disable deletion protection for selected component
+        run: |
+          set -euo pipefail
+
+          case "$LAYER/$TARGET" in
+            databricks/dev)
+              files=(
+                databricks/modules/catalog/main.tf
+                databricks/02-access-and-metastore.tf
+                databricks/05-storage-and-connections.tf
+              )
+              ;;
+            databricks/shared)
+              files=()
+              ;;
+            aws/dev)
+              files=(
+                modules/storage/main.tf
+              )
+              ;;
+            *)
+              echo "Unsupported teardown component: $LAYER/$TARGET"
+              exit 1
+              ;;
+          esac
+
+          for file in "${files[@]}"; do
+            test -f "$file"
+            sed -i -E \
+              's/prevent_destroy[[:space:]]*=[[:space:]]*true/prevent_destroy = false/g' \
+              "$file"
+          done
+
+      - name: Initialize selected Terraform state
+        run: |
+          set -euo pipefail
+          bash scripts/target.sh "$LAYER" "$TARGET" init
+
+      - name: Generate destruction plan
+        env:
+          TF_CLI_ARGS_plan: -destroy
+        run: |
+          set -euo pipefail
+          bash scripts/target.sh "$LAYER" "$TARGET" plan
+
+      - name: Verify deletion-only plan and summarize
+        run: |
+          set -euo pipefail
+
+          case "$LAYER/$TARGET" in
+            databricks/dev)
+              root="$GITHUB_WORKSPACE/databricks"
+              ;;
+            databricks/shared)
+              root="$GITHUB_WORKSPACE/databricks/shared"
+              ;;
+            aws/dev)
+              root="$GITHUB_WORKSPACE"
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+
+          export TF_DATA_DIR="$GITHUB_WORKSPACE/.tfdata/$LAYER/$TARGET"
+          plan="$TF_DATA_DIR/deployment.tfplan"
+          json="$RUNNER_TEMP/destroy-plan.json"
+
+          umask 077
+          trap 'rm -f "$json"' EXIT
+
+          terraform "-chdir=$root" show -json "$plan" > "$json"
+
+          jq -e '
+            all(.resource_changes[]?;
+              .change.actions == ["delete"] or
+              .change.actions == ["no-op"] or
+              .change.actions == ["read"]
+            )
+          ' "$json" >/dev/null
+
+          count=$(jq '
+            [.resource_changes[]?
+              | select(.mode == "managed")
+              | select(.change.actions == ["delete"])]
+            | length
+          ' "$json")
+
+          {
+            echo "### Destruction plan"
+            echo
+            echo "Component: $LAYER/$TARGET"
+            echo
+            echo "Managed resources to destroy: $count"
+            echo
+            echo '```text'
+            jq -r '
+              .resource_changes[]?
+              | select(.mode == "managed")
+              | select(.change.actions == ["delete"])
+              | .address
+            ' "$json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save destruction plan
+        id: save
+        if: inputs.apply
+        run: |
+          set -euo pipefail
+
+          file="$GITHUB_WORKSPACE/.tfdata/$LAYER/$TARGET/deployment.tfplan"
+          object="plans/$GITHUB_REPOSITORY/$LAYER/$TARGET/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT.tfplan"
+
+          aws s3 cp \
+            "$file" \
+            "s3://$PLAN_BUCKET/$object" \
+            --only-show-errors
+
+          echo "digest=$(sha256sum "$file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "object=$object" >> "$GITHUB_OUTPUT"
+
+  apply:
+    name: Apply destruction
+    needs: plan
+    if: ${{ inputs.apply && needs.plan.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    environment: ${{ inputs.component }}-apply
+
+    env:
+      DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
+      PLAN_BUCKET: ${{ vars.PLAN_BUCKET }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: 1.17.2
+          terraform_wrapper: false
+
+      - name: Configure AWS apply credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify AWS account and configuration
+        env:
+          EXPECTED: ${{ vars.AWS_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+
+          test "$EXPECTED" = "043309323736"
+          test "$(aws sts get-caller-identity --query Account --output text)" = "$EXPECTED"
+          test -n "$PLAN_BUCKET"
+
+          if [[ "$LAYER" == "databricks" ]]; then
+            test -n "$DATABRICKS_CLIENT_ID"
+          fi
+
+      - name: Initialize selected Terraform state
+        run: |
+          set -euo pipefail
+          bash scripts/target.sh "$LAYER" "$TARGET" init
+
+      - name: Verify and apply saved destruction plan
+        env:
+          OBJECT: ${{ needs.plan.outputs.object }}
+          DIGEST: ${{ needs.plan.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          test -n "$OBJECT"
+          test -n "$DIGEST"
+
+          file="$GITHUB_WORKSPACE/.tfdata/$LAYER/$TARGET/deployment.tfplan"
+
+          aws s3 cp \
+            "s3://$PLAN_BUCKET/$OBJECT" \
+            "$file" \
+            --only-show-errors
+
+          printf '%s  %s\n' "$DIGEST" "$file" |
+            sha256sum --check --status
+
+          bash scripts/target.sh "$LAYER" "$TARGET" apply
+
+      - name: Verify state has no managed resources
+        run: |
+          set -euo pipefail
+
+          case "$LAYER/$TARGET" in
+            databricks/dev)
+              root="$GITHUB_WORKSPACE/databricks"
+              ;;
+            databricks/shared)
+              root="$GITHUB_WORKSPACE/databricks/shared"
+              ;;
+            aws/dev)
+              root="$GITHUB_WORKSPACE"
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+
+          export TF_DATA_DIR="$GITHUB_WORKSPACE/.tfdata/$LAYER/$TARGET"
+
+          terraform "-chdir=$root" state pull |
+            jq -e '
+              [.resources[]?
+                | select(.mode == "managed")
+                | .instances[]?]
+              | length == 0
+            ' >/dev/null
+
+          {
+            echo "### Destruction completed"
+            echo
+            echo "Component: $LAYER/$TARGET"
+            echo
+            echo "Remaining managed resource instances in this state: 0"
+          } >> "$GITHUB_STEP_SUMMARY"
