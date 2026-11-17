@@ -120,6 +120,17 @@ jobs:
               "$file"
           done
 
+      - name: Diagnose state access
+        run: |
+          set -euo pipefail
+
+          aws sts get-caller-identity
+
+          aws s3api head-object \
+            --bucket shivam-dbx-tfstate-043309323736-ap-south-1 \
+            --key analytics/databricks/dev/terraform.tfstate \
+            --query '{Size:ContentLength,Encryption:ServerSideEncryption,KMSKey:SSEKMSKeyId}'
+
       - name: Initialize selected Terraform state
         run: |
           set -euo pipefail
