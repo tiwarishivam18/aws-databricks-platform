@@ -99,8 +99,10 @@ jobs:
                 databricks/05-storage-and-connections.tf
               )
               ;;
-            databricks/shared)
-              files=()
+              databricks/shared)
+              files=(
+                databricks/shared/groups.tf
+              )
               ;;
             aws/dev)
               files=(
